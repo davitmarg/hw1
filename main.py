@@ -62,5 +62,10 @@ def get_shifts_endpoint():
     shifts = get_existing_shifts()
     return {"shifts": shifts}
 
+@app.get("/")
+def root():
+    return {"status": "OK"}
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5000)
