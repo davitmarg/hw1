@@ -10,9 +10,6 @@ import asyncio
 import httpx
 import os
 from dotenv import load_dotenv
-import requests
-import json
-from time import sleep
 import uvicorn
 
 load_dotenv()
@@ -47,17 +44,18 @@ class Shift(BaseModel):
     endTime: str
     action: str
 
-def get_existing_shifts():
+async def get_existing_shifts_async():
     try:
-        res = requests.get(GET_SHIFTS_URL)
-        res.raise_for_status()
-        return res.json().get('shifts', [])
-    except requests.RequestException as e:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(GET_SHIFTS_URL)
+            res.raise_for_status()
+            return res.json().get('shifts', [])
+    except httpx.RequestError as e:
         print(f"Error fetching existing shifts: {e}")
         return []
 
-def shift_exists(shift):
-    existing_shifts = get_existing_shifts()
+async def shift_exists_async(shift):
+    existing_shifts = await get_existing_shifts_async()
     for ex in existing_shifts:
         if (ex['companyId'] == shift['companyId'] and
             ex['userId'] == shift['userId'] and
@@ -66,19 +64,24 @@ def shift_exists(shift):
             return True
     return False
 
-def add_shift(shift):
+async def add_shift_async(shift):
     headers = {'Content-Type': 'application/json'}
-    if shift_exists(shift):
-        print(f"Shift for user {shift['userId']} already exists, skipping.")
-        return
-    while not shift_exists(shift):
-        response = requests.post(BASE_URL, headers=headers, data=json.dumps(shift))
-        sleep(0.3)
-
-def post_shifts(shifts):
-    for shift in shifts:
-        add_shift(shift)
-    return get_existing_shifts()
+    try:
+        if await shift_exists_async(shift):
+            print(f"Shift for user {shift['userId']} already exists, skipping.")
+            return True
+        async with httpx.AsyncClient() as client:
+            while not await shift_exists_async(shift):
+                try:
+                    await client.post(BASE_URL, headers=headers, json=shift)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    print(f"Failed to post shift: {e}")
+                    return False
+        return True
+    except Exception as e:
+        print(f"Failed to process shift: {e}")
+        return False
 
 @app.post("/shifts")
 async def post_shifts_endpoint(shifts: List[Shift], db: AsyncSession = Depends(lambda: async_session())):
@@ -89,7 +92,10 @@ async def post_shifts_endpoint(shifts: List[Shift], db: AsyncSession = Depends(l
 
     asyncio.create_task(process_shift_request(shift_request.id, shifts))
 
-    return {"request_id": shift_request.id}
+    return {
+        "message": "Shifts request received",
+        "request_id": shift_request.id
+    }
 
 @app.get("/shifts/status/{request_id}")
 async def get_shift_status(request_id: int, db: AsyncSession = Depends(lambda: async_session())):
@@ -97,8 +103,8 @@ async def get_shift_status(request_id: int, db: AsyncSession = Depends(lambda: a
     return {"status": request.status if request else "not_found"}
 
 @app.get("/shifts")
-def get_shifts_endpoint():
-    shifts = get_existing_shifts()
+async def get_shifts_endpoint():
+    shifts = await get_existing_shifts_async()
     return {"shifts": shifts}
 
 async def process_shift_request(request_id: int, shifts: List[Shift]):
@@ -110,18 +116,14 @@ async def process_shift_request(request_id: int, shifts: List[Shift]):
         request.status = "processing"
         await db.commit()
 
+        all_successful = True
         for shift in shifts:
-            try:
-                shift_data = shift.dict()
-                if not shift_exists(shift_data):
-                    headers = {'Content-Type': 'application/json'}
-                    while not shift_exists(shift_data):
-                        res = requests.post(BASE_URL, headers=headers, data=json.dumps(shift_data))
-                        sleep(0.3)
-            except Exception as e:
-                print(f"Failed to process shift: {e}")
+            shift_data = shift.dict()
+            success = await add_shift_async(shift_data)
+            if not success:
+                all_successful = False
 
-        request.status = "done"
+        request.status = "done" if all_successful else "failed"
         await db.commit()
 
 @app.on_event("startup")
