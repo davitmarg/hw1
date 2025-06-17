@@ -1,11 +1,11 @@
 from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String, DateTime, select
+from sqlalchemy import Column, Integer, String, DateTime, select, func
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
+
 import asyncio
 import httpx
 import os
@@ -31,11 +31,18 @@ app = FastAPI()
 BASE_URL = "http://localhost:8181/shift"
 GET_SHIFTS_URL = "http://localhost:8181/shifts"
 
-class ShiftRequest(Base):
-    __tablename__ = "shift_requests"
-    id = Column(Integer, primary_key=True, index=True)
+class StoredShift(Base):
+    __tablename__ = "stored_shifts"
+    id = Column(Integer, primary_key=True, index=True) 
+    request_id = Column(Integer, nullable=False)
     status = Column(String(20), default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    companyId = Column(String(255))
+    userId = Column(String(255))
+    startTime = Column(String(255))
+    endTime = Column(String(255))
+    action = Column(String(255))
 
 class Shift(BaseModel):
     companyId: str
@@ -85,46 +92,71 @@ async def add_shift_async(shift):
 
 @app.post("/shifts")
 async def post_shifts_endpoint(shifts: List[Shift], db: AsyncSession = Depends(lambda: async_session())):
-    shift_request = ShiftRequest(status="pending")
-    db.add(shift_request)
-    await db.flush()
+    
+    # Get current max request_id
+    result = await db.execute(select(func.max(StoredShift.request_id)))
+    max_request_id = result.scalar() or 0
+    request_id = max_request_id + 1
+
+    for shift in shifts:
+        db.add(StoredShift(
+            request_id=request_id,
+            status="pending",
+            companyId=shift.companyId,
+            userId=shift.userId,
+            startTime=shift.startTime,
+            endTime=shift.endTime,
+            action=shift.action
+        ))
+
     await db.commit()
-
-    asyncio.create_task(process_shift_request(shift_request.id, shifts))
-
-    return {
-        "message": "Shifts request received",
-        "request_id": shift_request.id
-    }
+    asyncio.create_task(process_shifts_background(request_id))
+    return {"message": "Shifts stored", "request_id": request_id}
 
 @app.get("/shifts/status/{request_id}")
 async def get_shift_status(request_id: int, db: AsyncSession = Depends(lambda: async_session())):
-    request = await db.get(ShiftRequest, request_id)
-    return {"status": request.status if request else "not_found"}
+    result = await db.execute(select(StoredShift).where(StoredShift.request_id == request_id))
+    shifts = result.scalars().all()
+
+    if not shifts:
+        return {"status": "not_processing"}
+    statuses = [s.status for s in shifts]
+    if any(s == "pending" or s == "processing" for s in statuses):
+        return {"status": "processing"}
+    if all(s == "done" for s in statuses):
+        return {"status": "done"}
+    if all(s == "failed" for s in statuses):
+        return {"status": "failed"}
+    return {"status": "partial_failure"}
 
 @app.get("/shifts")
 async def get_shifts_endpoint():
     shifts = await get_existing_shifts_async()
     return {"shifts": shifts}
 
-async def process_shift_request(request_id: int, shifts: List[Shift]):
+async def process_shifts_background(request_id: int):
     async with async_session() as db:
-        request = await db.get(ShiftRequest, request_id)
-        if not request:
-            return
+        result = await db.execute(select(StoredShift).where(
+            StoredShift.request_id == request_id,
+            StoredShift.status == "pending"
+        ))
+        shifts = result.scalars().all()
 
-        request.status = "processing"
-        await db.commit()
+        for stored_shift in shifts:
+            stored_shift.status = "processing"
+            await db.commit()
 
-        all_successful = True
-        for shift in shifts:
-            shift_data = shift.dict()
+            shift_data = {
+                "companyId": stored_shift.companyId,
+                "userId": stored_shift.userId,
+                "startTime": stored_shift.startTime,
+                "endTime": stored_shift.endTime,
+                "action": stored_shift.action
+            }
+
             success = await add_shift_async(shift_data)
-            if not success:
-                all_successful = False
-
-        request.status = "done" if all_successful else "failed"
-        await db.commit()
+            stored_shift.status = "done" if success else "failed"
+            await db.commit()
 
 @app.on_event("startup")
 async def startup():
