@@ -1,3 +1,4 @@
+import uuid
 from fastapi import FastAPI, Depends
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -6,6 +7,8 @@ from pydantic import BaseModel
 from typing import List
 from datetime import datetime
 
+from contextlib import asynccontextmanager
+
 import asyncio
 import httpx
 import os
@@ -13,20 +16,45 @@ from dotenv import load_dotenv
 import uvicorn
 
 load_dotenv()
-
 user = os.getenv("DB_USER")
 password = os.getenv("DB_PASSWORD")
 host = os.getenv("DB_HOST")
 port = os.getenv("DB_PORT")
 dbname = os.getenv("DB_NAME")
+shard_count = int(os.getenv("DB_SHARD_COUNT", 1))
 
-DATABASE_URL = f"mysql+asyncmy://{user}:{password}@{host}:{port}/{dbname}"
+BASE_DATABASE_URL = f"mysql+asyncmy://{user}:{password}@{host}:{port}/{dbname}"
 
-engine = create_async_engine(DATABASE_URL, echo=True)
-async_session = async_sessionmaker(engine, expire_on_commit=False)
+for i in range(shard_count):
+    print(f"Shard {i}: {BASE_DATABASE_URL}_{i}")
+
+shard_engines = [
+    create_async_engine(f"{BASE_DATABASE_URL}_{i}", echo=True)
+    for i in range(shard_count)
+]
+shard_sessions = [
+    async_sessionmaker(engine, expire_on_commit=False)
+    for engine in shard_engines
+]
+
+
+def get_shard_index_by_user_id(user_id: str) -> int:
+    return hash(user_id) % shard_count
+
+def get_shard_session_by_user_id(user_id: str) -> AsyncSession:
+    shard_idx = get_shard_index_by_user_id(user_id)
+    return shard_sessions[shard_idx]()
+
 Base = declarative_base()
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    for engine in shard_engines:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 BASE_URL = "http://localhost:8181/shift"
 GET_SHIFTS_URL = "http://localhost:8181/shifts"
@@ -34,7 +62,7 @@ GET_SHIFTS_URL = "http://localhost:8181/shifts"
 class StoredShift(Base):
     __tablename__ = "stored_shifts"
     id = Column(Integer, primary_key=True, index=True) 
-    request_id = Column(Integer, nullable=False)
+    request_id = Column(String(36), nullable=False)
     status = Column(String(20), default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -90,43 +118,47 @@ async def add_shift_async(shift):
         print(f"Failed to process shift: {e}")
         return False
 
+
 @app.post("/shifts")
-async def post_shifts_endpoint(shifts: List[Shift], db: AsyncSession = Depends(lambda: async_session())):
-    
-    # Get current max request_id
-    result = await db.execute(select(func.max(StoredShift.request_id)))
-    max_request_id = result.scalar() or 0
-    request_id = max_request_id + 1
+async def post_shifts_endpoint(shifts: List[Shift]):
+    request_id = str(uuid.uuid4())
 
     for shift in shifts:
-        db.add(StoredShift(
-            request_id=request_id,
-            status="pending",
-            companyId=shift.companyId,
-            userId=shift.userId,
-            startTime=shift.startTime,
-            endTime=shift.endTime,
-            action=shift.action
-        ))
+        shard_id = get_shard_index_by_user_id(shift.userId)
+        async with shard_sessions[shard_id]() as db:
+            stored_shift = StoredShift(
+                request_id=request_id,
+                companyId=shift.companyId,
+                userId=shift.userId,
+                startTime=shift.startTime,
+                endTime=shift.endTime,
+                action=shift.action
+            )
+            db.add(stored_shift)
+            await db.commit()
 
-    await db.commit()
     asyncio.create_task(process_shifts_background(request_id))
     return {"message": "Shifts stored", "request_id": request_id}
 
 @app.get("/shifts/status/{request_id}")
-async def get_shift_status(request_id: int, db: AsyncSession = Depends(lambda: async_session())):
-    result = await db.execute(select(StoredShift).where(StoredShift.request_id == request_id))
-    shifts = result.scalars().all()
+async def get_shift_status(request_id: str):
+    statuses = []
+    for idx in range(shard_count):
+        async with shard_sessions[idx]() as db:
+            result = await db.execute(select(StoredShift).where(
+                StoredShift.request_id == request_id
+            ))
+            shifts = result.scalars().all()
+            statuses += [s.status for s in shifts]
 
-    if not shifts:
+    if not statuses:
         return {"status": "not_processing"}
-    statuses = [s.status for s in shifts]
-    if any(s == "pending" or s == "processing" for s in statuses):
-        return {"status": "processing"}
     if all(s == "done" for s in statuses):
         return {"status": "done"}
     if all(s == "failed" for s in statuses):
         return {"status": "failed"}
+    if any(s in ["pending", "processing"] for s in statuses):
+        return {"status": "processing"}
     return {"status": "partial_failure"}
 
 @app.get("/shifts")
@@ -135,33 +167,31 @@ async def get_shifts_endpoint():
     return {"shifts": shifts}
 
 async def process_shifts_background(request_id: int):
-    async with async_session() as db:
-        result = await db.execute(select(StoredShift).where(
-            StoredShift.request_id == request_id,
-            StoredShift.status == "pending"
-        ))
-        shifts = result.scalars().all()
 
-        for stored_shift in shifts:
-            stored_shift.status = "processing"
-            await db.commit()
+    for idx in range(shard_count):
+        async with shard_sessions[idx]() as db:
+            result = await db.execute(select(StoredShift).where(
+                StoredShift.request_id == request_id,
+                StoredShift.status == "pending"
+            ))
+            shifts = result.scalars().all()
 
-            shift_data = {
-                "companyId": stored_shift.companyId,
-                "userId": stored_shift.userId,
-                "startTime": stored_shift.startTime,
-                "endTime": stored_shift.endTime,
-                "action": stored_shift.action
-            }
+            for stored_shift in shifts:
+                stored_shift.status = "processing"
+                await db.commit()
 
-            success = await add_shift_async(shift_data)
-            stored_shift.status = "done" if success else "failed"
-            await db.commit()
+                shift_data = {
+                    "companyId": stored_shift.companyId,
+                    "userId": stored_shift.userId,
+                    "startTime": stored_shift.startTime,
+                    "endTime": stored_shift.endTime,
+                    "action": stored_shift.action
+                }
 
-@app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+                success = await add_shift_async(shift_data)
+                stored_shift.status = "done" if success else "failed"
+                await db.commit()
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5000)
