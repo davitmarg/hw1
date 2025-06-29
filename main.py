@@ -6,16 +6,27 @@ from sqlalchemy import Column, Integer, String, DateTime, select, func
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
-
-from contextlib import asynccontextmanager
+import boto3
+import json
 
 import asyncio
 import httpx
 import os
 from dotenv import load_dotenv
 import uvicorn
+from contextlib import asynccontextmanager
 
 load_dotenv()
+
+sqs = boto3.client(
+    "sqs",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION"),
+)
+SQS_URL = os.getenv("SQS_URL")
+
+
 user = os.getenv("DB_USER")
 password = os.getenv("DB_PASSWORD")
 host = os.getenv("DB_HOST")
@@ -24,6 +35,18 @@ dbname = os.getenv("DB_NAME")
 shard_count = int(os.getenv("DB_SHARD_COUNT", 1))
 
 BASE_DATABASE_URL = f"mysql+asyncmy://{user}:{password}@{host}:{port}/{dbname}"
+
+def send_to_sqs(payload: str):
+    sqs = boto3.client(
+        'sqs',
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION")
+    )
+    sqs.send_message(
+        QueueUrl=os.getenv("SQS_URL"),
+        MessageBody=payload
+    )
 
 for i in range(shard_count):
     print(f"Shard {i}: {BASE_DATABASE_URL}_{i}")
@@ -190,6 +213,20 @@ async def process_shifts_background(request_id: int):
 
                 success = await add_shift_async(shift_data)
                 stored_shift.status = "done" if success else "failed"
+
+                if success:
+                    send_to_sqs(json.dumps({
+                        "id": stored_shift.id,
+                        "request_id": stored_shift.request_id,
+                        "status": stored_shift.status,
+                        "created_at": stored_shift.created_at.isoformat() if stored_shift.created_at else None,
+                        "companyId": stored_shift.companyId,
+                        "userId": stored_shift.userId,
+                        "startTime": stored_shift.startTime,
+                        "endTime": stored_shift.endTime,
+                        "action": stored_shift.action
+                    }))
+
                 await db.commit()
 
 
